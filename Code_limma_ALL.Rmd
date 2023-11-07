@@ -1,0 +1,897 @@
+---
+title: "MiBlend_DEG_Analysis"
+author: "Julia DeBenedictis"
+date: '`r Sys.Date()`'
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: journal
+---
+
+# DEG Analysis of Participant Baseline vs Post-Tests and by Dietary Intervention (DI #1-7)
+
+## Install packages
+```{r, install packages, message=FALSE}
+library(limma)
+library(dplyr)
+library(magrittr)
+library(Matrix)
+library(ggplot2)
+library(lattice)
+library(tibble)
+library(data.table)
+library(knitr)
+library(DT)
+library(plotly)
+library(ensembldb)
+library(multtest)
+library(dbplyr)
+library(markdown)
+require(pheatmap)
+options(timeout=30000)
+library(AnnotationHub)
+require(DESeq2)
+require(edgeR)
+require(PCAtools)
+```
+
+
+## Overview:
+
+```{r Set_Parameters, echo=T, include=TRUE}
+RunID <- "MiBlend_DEGanalysis"
+species <- "human"
+Platform <- "RNA-Seq"
+DESIGN <- "DI" #DI = Dietary intervention
+
+# Set thresholds for Differential Expression (based on R-ODAF)
+minCoverage <- 3000000
+MinCount <- 1
+Pval <- 0.05 
+
+# Names of files to load
+SampleDataFile <- "genes.data.GlobinRiboDepleted.csv"
+SampleInfoFile <- "MiBlend_SampleKey_Masterlist_220714_LongFormat_edit_230310.csv"
+```
+
+```{r Set_dir, echo=T, include=FALSE}
+SampleFile.location<-"L:/FHML_TGX/MiFood/RNAseq/GlobinRiboDepletion/"
+outputdir_main<-"L:/FHML_TGX/MiFood/RNAseq/Limma_approach/"
+```
+
+```{r, Set_Directories, include = TRUE, echo=FALSE}
+setwd(outputdir_main)
+
+# Create subfolders in main directory for data processing figures
+outputdir_pre <-paste0(outputdir_main, "Data_Processing/")
+if (!file.exists(outputdir_pre)) {dir.create(outputdir_pre)}
+knitr::opts_knit$set(root.dir = outputdir_main)
+
+# Create "DEGanalysis" Folder
+outputdir_DEG <-paste0(outputdir_main, "DEGanalysis/")
+if (!file.exists(outputdir_DEG)) {dir.create(outputdir_DEG)}
+knitr::opts_knit$set(root.dir = outputdir_DEG)
+
+# Load input files 
+sampleData <- read.delim(paste0(SampleFile.location, SampleDataFile), sep=",", stringsAsFactors=FALSE, header=TRUE,  quote="\"", row.names=1)
+
+metaData <- read.delim(paste0(SampleFile.location, SampleInfoFile), sep=",", stringsAsFactors=FALSE, header=TRUE,  quote="\"", row.names=NULL)
+
+# CLEANING input files
+metaData <- metaData[metaData$SeqBatch>0,] 
+# Remove samples that were not sequenced from the SampleKey
+
+# For resequenced samples: remove files from batch 2 --> keep files from batch 3
+reSeqDelete_B2<-c("P62_T1_S113", "P62_T3_S114", "P81_T1_S70", "P81_T2_S71", "P81_T3_S72")
+sampleData <- sampleData[,!(colnames(sampleData) %in% reSeqDelete_B2)]
+
+# Replace SampleSeqName with SampleID
+rownames(metaData) <- metaData$SampleSeqName 
+# creates rownames with SampleSeqName
+metaData <- metaData[order(rownames(metaData)),] 
+# sort rows by rowname (SampleSeqName)
+sampleData <- sampleData[,order(colnames(sampleData))] 
+#order sampledata by colnames
+if (sum(rownames(metaData)==colnames(sampleData))==ncol(sampleData)) {
+  rownames(metaData)<-metaData$SampleID
+  colnames(sampleData)<-metaData$SampleID
+}else{
+  print("Failed to rename input files to SampleID")
+}
+
+# Correct swapped sample ID names
+
+colnames(sampleData) <- ifelse(colnames(sampleData)=="P22_D5_T2", "P21_D2_T2", ifelse(colnames(sampleData)=="P21_D2_T2", "P22_D5_T2", colnames(sampleData)))
+
+colnames(sampleData) <- ifelse(colnames(sampleData)=="P44_D3_T3", "P41_D1_T3", ifelse(colnames(sampleData)=="P41_D1_T3", "P44_D3_T3", colnames(sampleData)))
+
+
+### Subset baseline data to only include smoothie interventions:
+# REMOVE PEARL INTERVENTIONS (DI-8 AND 9)
+meta7 <- metaData
+
+Remove <- meta7[(meta7$DI=="D8" | meta7$DI=="D9"),]
+Remove <- Remove$SampleID
+
+meta7<-meta7[!(meta7$DI=="D8" | meta7$DI=="D9"),]
+samples <- sampleData[, rownames(meta7)]
+
+print(paste0(Remove, " was removed for being a post-test sample of a Pearl intervention."))
+print(paste0("From the total of ", ncol(sampleData), " samples, ", ncol(samples), " samples are remaining"))
+```
+
+### Overview of samples and groups:
+
+```{r, SampleInfo, echo=FALSE, results='asis'}
+datatable(meta7)
+```
+
+
+## Data pre-processing:
+
+### Data clean-up: replace NA with 0
+
+```{r echo=FALSE, include=TRUE}
+ZeroDetected<-count(samples[ is.na(samples)])
+samples[ is.na(samples)] <- 0 
+print(paste0(ZeroDetected, " replacement of NA values"))
+```
+
+### Remove samples with total readcount < threshold (3M):
+
+```{r echo=FALSE, include=TRUE}
+Keep <- ncol(samples[,(colSums(samples)> minCoverage)])
+Remove <- names(samples[(colSums(samples)< minCoverage)])
+print(paste0(Remove, " had to be removed due to low sequencing depth (<3M)."))
+samples <- samples[,(colSums(samples)> minCoverage)]
+meta7 <- meta7[rownames(meta7) %in% colnames(samples),]
+
+# remove matched samples of P6T1 from samples & meta7
+meta7 <- meta7[c(grep("P6_D*",rownames(meta7), invert=TRUE)),]
+samples <- samples[, rownames(meta7)]
+print(paste0("Matched samples of P6 have been removed from the dataset because their baseline measurement was removed due to low sequencing depth."))
+
+# remove P174 bc only has T0 and create new matrices
+meta7 <- meta7[c(grep("P174_D0_T1",rownames(meta7), invert=TRUE)),]
+samples <- samples[, rownames(meta7)]
+print("P174_D0_T1 was removed because only the baseline measurement is remaining for this participant")
+
+# summary
+print(paste0("From the total of ", ncol(sampleData), " samples, now ", ncol(samples), " samples are remaining"))
+```
+
+### Create columns which can identify pair-matched groups for model analysis
+
+```{r, Make groups pair-matched for model analysis}
+
+# create "Pre" and "Post" column needed for later subsetted analysis comparisons
+meta7$Time <- ifelse(meta7$TD == 1, "Baseline", "PostTest")
+
+# Subset but maintain baseline values for all participant intervention groups by creating additional columns
+meta7 <- meta7 %>%
+  group_by(PCode) %>%
+  mutate(D1 = ifelse("D1" %in% DI, TRUE, FALSE))
+
+meta7 <- meta7 %>%
+  group_by(PCode) %>%
+  mutate(D2 = ifelse("D2" %in% DI, TRUE, FALSE))
+
+meta7 <- meta7 %>%
+  group_by(PCode) %>%
+  mutate(D3 = ifelse("D3" %in% DI, TRUE, FALSE))
+
+meta7 <- meta7 %>%
+  group_by(PCode) %>%
+  mutate(D4 = ifelse("D4" %in% DI, TRUE, FALSE))
+
+meta7 <- meta7 %>%
+  group_by(PCode) %>%
+  mutate(D5 = ifelse("D5" %in% DI, TRUE, FALSE))
+
+meta7 <- meta7 %>%
+  group_by(PCode) %>%
+  mutate(D6 = ifelse("D6" %in% DI, TRUE, FALSE))
+
+meta7 <- meta7 %>%
+  group_by(PCode) %>%
+  mutate(D7 = ifelse("D7" %in% DI, TRUE, FALSE))
+
+meta7$D1 <- ifelse(meta7$DI %in% c("D0", "D1"), meta7$D1, "FALSE")
+meta7$D2 <- ifelse(meta7$DI %in% c("D0", "D2"), meta7$D2, "FALSE")
+meta7$D3 <- ifelse(meta7$DI %in% c("D0", "D3"), meta7$D3, "FALSE")
+meta7$D4 <- ifelse(meta7$DI %in% c("D0", "D4"), meta7$D4, "FALSE")
+meta7$D5 <- ifelse(meta7$DI %in% c("D0", "D5"), meta7$D5, "FALSE")
+meta7$D6 <- ifelse(meta7$DI %in% c("D0", "D6"), meta7$D6, "FALSE")
+meta7$D7 <- ifelse(meta7$DI %in% c("D0", "D7"), meta7$D7, "FALSE")
+
+# Add subsetting column
+meta7$Group <- meta7$DI
+meta7$Time.Group <- paste0(meta7$Time, ".", meta7$Group)
+```
+
+### Make a DGE object with sample, count, and gene information for down-stream analysis
+
+```{r, EdgeR - Make DGE Object, message=FALSE}
+library(edgeR)
+library(Homo.sapiens)
+library(biomaRt)
+#if (!require("BiocManager", quietly = TRUE))
+ #   install.packages("BiocManager")
+
+#BiocManager::install("Homo.sapiens")
+
+# MAKE DGE OBJECT FOR ENTIRE DATA SET FOR EXPLORATION/NORMALIZATION ETC.
+x <- DGEList(counts=samples)
+samplenames <- rownames(meta7) 
+colnames(x) <- samplenames
+
+sampleid <- as.factor(meta7$SampleID)
+x$samples$sampleid <- sampleid
+
+pcode <- as.factor(meta7$PCode)
+x$samples$pcode <- pcode
+
+group <- as.factor(meta7$DI) 
+x$samples$group <- group 
+
+td <- as.factor(meta7$TD)
+x$samples$td <- td
+
+time <- as.factor(meta7$Time)
+x$samples$time <- time
+
+subset <- as.factor(meta7$Time.Group)
+x$samples$subset <- subset
+
+batch <- as.factor(meta7$SeqBatch) 
+x$samples$batch <- batch 
+
+sex <- as.factor(meta7$Sex) 
+x$samples$sex <- sex 
+
+covid <- as.factor(meta7$Covid)
+x$samples$covid <- covid
+
+age_bin <- as.factor(meta7$Age_Bin)
+x$samples$age_bin <- age_bin
+
+wbc_bin <- as.factor(meta7$WBC_Count_Bin)
+x$samples$wbc_bin <- wbc_bin
+
+bmi_bin <- as.factor(meta7$BMI_Bin)
+x$samples$bmi_bin <-bmi_bin
+
+# make fewer bins for bmi
+meta7$BMI_3 <- ifelse(meta7$BMI_Bin %in% c("19", "20"), "L", "M")
+meta7$BMI_3 <- ifelse(meta7$BMI_Bin %in% c("26", "27"), "H", meta7$BMI_3)
+
+bmi_3 <- as.factor(meta7$BMI_3)
+x$samples$bmi_3 <-bmi_3
+
+# make fewer bins for bmi, alternate option
+meta7$BMI_HL <- ifelse(meta7$BMI_Bin %in% c("19", "20", "21", "22"), "L", "H")
+
+bmi_hl <- as.factor(meta7$BMI_HL)
+x$samples$bmi_hl <-bmi_hl
+
+season <- as.factor(meta7$Season)
+x$samples$season <- season
+
+# create gene annotation list
+geneid <- rownames(x)
+genes <- biomaRt::select(Homo.sapiens, keys=geneid, columns=c("SYMBOL", "ENTREZID", "TXCHROM"), keytype="ENSEMBL", groupBY="ENSEMBL", selectFun=max)
+
+genes <- genes[!duplicated(genes$ENSEMBL),]
+x$genes <- genes
+
+datatable(x$samples)
+x$counts[1:20,1:6]
+```
+
+### Convert raw counts to CPM & log-CPM
+
+```{r, convert reads to cpm & lcpm}
+# convert reads to cpm and log-transformed cpm
+cpm <- cpm(x)
+lcpm <- cpm(x, log=TRUE)
+
+L <- mean(x$samples$lib.size) * 1e-6
+M <- median(x$samples$lib.size) * 1e-6
+c(L, M)
+summary(lcpm[1:5,1:20])
+```
+
+### Remove genes that are lowly expressed 
+
+```{r, remove lowly expressed genes, echo=FALSE}
+# number of genes with no expression across samples
+print(table(rowSums(x$counts==0)==383)) # result is 5276 or ~ 9.2%
+print(paste0("'TRUE' = number of genes in dataset that have zero counts across all ", ncol(samples)," samples"))
+```
+
+```{r, stringent removal, echo=FALSE}
+# remove genes which are below 1 CPM
+
+# calculate cpm for each gene
+cpm_matrix <- cpm(x$counts)
+# Identify genes with CPM less than 1 in all samples
+lowly_expressed_genes <- rownames(cpm_matrix)[apply(cpm_matrix, 1, min) < 1]
+
+# Remove the lowly expressed genes from the expression matrix
+x$counts <- x$counts[!(rownames(x$counts) %in% lowly_expressed_genes),]
+
+print(paste0(length(lowly_expressed_genes), " genes have been removed due to having less than 1 CPM, leaving ", nrow(x$counts), " remaining genes"))
+```
+
+#### Figure 1: The density of log-CPM values for raw pre-filtered data (A) and post-filtered data (B) are shown by sample
+
+``` {r, PLOT - change from removing lowly expressed genes, echo=FALSE}
+# plot changes
+lcpm.cutoff <- log2(10/M + 2/L)
+library(RColorBrewer)
+
+nsamples <- ncol(x)
+col <- brewer.pal(nsamples, "Paired")
+par(mfrow=c(1,2))
+sampleids <- meta7$SampleID
+
+# plot A (pre-removal)
+lcpmA <- lcpm
+
+plot(density(lcpmA[,1]), col=col[1], lwd=2, ylim=c(0,0.26), las=2, main="", xlab="")
+title(main="A. Raw data", xlab="Log-cpm")
+abline(v=lcpm.cutoff, lty=3)
+for (i in 2:nsamples){
+  den <- density(lcpmA[,i])
+  lines(den$x, den$y, col=col[i], lwd=2)
+}
+legend("topright", sampleids, text.col=col, bty="n")
+
+# plot B (post-removal)
+lcpmB <- cpm(x, log=TRUE)
+
+plot(density(lcpmB[,1]), col=col[1], lwd=2, ylim=c(0,0.26), las=2, main="", xlab="")
+title(main="B. Filtered data", xlab="Log-cpm")
+abline(v=lcpm.cutoff, lty=3)
+for (i in 2:nsamples){
+  den <- density(lcpmB[,i])
+  lines(den$x, den$y, col=col[i], lwd=2)
+}
+legend("topright", sampleids, text.col=col, bty="n")
+
+#setwd(outputdir_pre)
+#dev.copy(png, paste0("Removal of lowly expressed genes below 1 CPM", "_ALL_intg", Sys.Date(), ".png"))
+
+#dev.off()
+
+# unfortunately these plots can't fit every sample in the data set in the figure, but it still provides a snapshot of what changes have been applied to the whole data sest
+```
+
+### Normalizing gene expression distributions
+
+```{r, normalization of all samples via edgeR}
+# Normalisation by the method of trimmed mean of M-values (TMM) (Robinson and Oshlack 2010) is performed using the calcNormFactors function in edgeR. The normalisation factors calculated here are used as a scaling factor for the library sizes.
+
+x <- calcNormFactors(x, method = "TMM")
+x$samples$norm.factors
+lcpm <- cpm(x, log=TRUE)
+```
+
+#### Figure 2: Boxplots of log-CPM values showing expression distributions for unnormalised data (A) and normalised data (B) for the first 100 samples in the modified dataset
+
+```{r, PLOT - normalization, echo=FALSE}
+# duplicate x to visualize effect of normalization
+x2 <- x
+x2$samples$norm.factors <- 1
+x2$counts[,1] <- ceiling(x2$counts[,1]*0.05)
+x2$counts[,2] <- x2$counts[,2]*5
+
+# boxplot showing norm of 100 (split plots)
+## unnormalized plot
+lcpm <- cpm(x2, log=TRUE)
+boxplot(lcpm[,1:100], las=2, col=col, main="")
+title(main="A. Example: Unnormalised data", ylab="Log-cpm")
+
+#setwd(outputdir_pre)
+#dev.copy(png, paste0("Unnormalized_logCPMvalues_100_intg", "_genesbelow1CPM_", Sys.Date(), ".png"))
+#dev.off()
+
+## normalized plot
+x2b <- calcNormFactors(x2)
+x2b$samples$norm.factors
+
+lcpm <- cpm(x2b, log=TRUE)
+boxplot(lcpm[,1:100], las=2, col=col, main="")
+title(main="B. Example: Normalised data", ylab="Log-cpm")
+
+#setwd(outputdir_pre)
+#dev.copy(png, paste0("Normalized_logCPMvalues_100_intg", "_genesbelow1CPM_", Sys.Date(), ".png"))
+#dev.off()
+```
+
+### Unsupervised clustering of the samples
+
+#### Figure 3: MDS plots by different study factors
+
+```{r, PLOT - Unsupervised Clustering, echo=FALSE}
+# Manual plots  - I used the interactive Glimma plots for the analysis but have included manual plots for this html output
+
+setwd(outputdir_pre)
+
+lcpm <- cpm(x, log=TRUE)
+
+# plot by group
+col.group <- group
+levels(col.group) <-  brewer.pal(nlevels(col.group), "Set3")
+col.group <- as.character(col.group)
+
+plotMDS(lcpm, labels=group, col=col.group)
+title(main="A. Intervention groups")
+
+# plot by batch
+col.batch <- batch
+levels(col.batch) <-  brewer.pal(nlevels(col.batch), "Set3")
+col.batch <- as.character(col.batch)
+
+plotMDS(lcpm, labels=batch, col=col.batch)
+title(main="B. Sequencing batch")
+
+# plot by sex
+col.sex <- sex
+levels(col.sex) <- brewer.pal(nlevels(col.sex), "Set3")
+col.sex <- as.character(col.sex)
+
+plotMDS(lcpm, labels=sex, col=col.sex)
+title(main="C. Sex")
+
+# plot by age
+col.age <- age_bin
+levels(col.age) <- brewer.pal(nlevels(col.age), "Set3")
+col.age <- as.character(col.age)
+
+plotMDS(lcpm, labels=age_bin, col=col.age)
+title(main="D. Age")
+
+# plot by season
+col.season <- season
+levels(col.season) <- brewer.pal(nlevels(col.season), "Set3")
+col.season <- as.character(col.season)
+
+plotMDS(lcpm, labels=season, col=col.season)
+title(main="E. Season")
+
+# plot by wbc
+col.wbc <- wbc_bin
+levels(col.wbc) <- brewer.pal(nlevels(col.wbc), "Set3")
+col.wbc <- as.character(col.wbc)
+
+plotMDS(lcpm, labels=wbc_bin, col=col.wbc)
+title(main="F. WBC count")
+
+# plot by bmi
+col.bmi <- bmi_bin
+levels(col.bmi) <- brewer.pal(nlevels(col.bmi), "Set3")
+col.bmi <- as.character(col.bmi)
+
+plotMDS(lcpm, labels=bmi_bin, col=col.bmi)
+title(main="G. BMI")
+
+
+# Interactive plot code
+
+#library(Glimma)
+#setwd(outputdir_pre)
+
+#glMDSPlot(lcpm, labels=paste(pcode, group, td, batch, sex, covid, age_bin, wbc_bin, bmi_hl, bmi_3, season, sep="_"), groups=x$samples[,c(5, 1, 6:17)],
+#         launch=TRUE)
+
+#BMI is not a relevant clustering factor
+
+# test biological replicates 
+
+#testL <- lcpm[,320:383]
+#colnames(testL) <- meta7$SampleID[320:383]
+#testP <- pcode[320:383]
+
+#glMDSPlot(testL, labels=testP, groups=testP,
+#         launch=TRUE)
+
+#rm(testL)
+#rm(testP)
+```
+
+
+## Differential Expression Analysis
+
+```{r, Begin modeling - Define Parameters, include=FALSE, echo=FALSE}
+# Create subfolders in "DEGanalysis" folder for different interventions
+
+# Create output folder
+outputdir_newCPM <-paste0(outputdir_DEG, "newmodel_CPM", "/")
+if (!file.exists(outputdir_newCPM)) {dir.create(outputdir_newCPM)}
+
+# this folder name refers to the way the matched baseline comparisons are integrated into the final dge object while retaining the original normalization and pcode correlation values
+```
+
+### Determine correlation of participants to their repeated samples
+
+```{r, determine if Pcode is pos correlated, echo=FALSE}
+# is pcode positively correlated?
+library(statmod)
+design <- model.matrix(~0+subset+sex+batch)
+dupcor <- duplicateCorrelation(lcpm, design, block=pcode)
+print(paste0("The correlation of PCode in the sample set is ", dupcor$consensus.correlation))
+```
+
+### Create a new dataframe to allow for the appropriate model creation for the comparison of all baseline to post-test measurements
+
+```{r, create new dataframe for model creation, message=FALSE, warning=FALSE}
+# Duplicate baseline values based on how many post-tests a participant has
+# rename DI to Group to avoid following code confusing it 
+library(tidyr)
+
+meta_dup <- meta7 %>%
+  pivot_longer(cols = starts_with("D"), names_to = "D_var", values_to = "D_val") %>%
+  dplyr::filter(D_val == TRUE) %>%
+  dplyr::select(-D_val) %>%
+  group_by(Time) %>%
+  dplyr::slice(rep(seq_len(n()), length.out = n()))
+
+# create new dataframe for samples_dup
+num_col <- 482
+num_row <-57241
+
+samples_dup <- data.frame(matrix(ncol = num_col, nrow = num_row))
+for(i in 1:num_col){
+  samples_dup[[i]] <- NA
+}
+colnames(samples_dup) <- meta_dup$SampleID
+
+# match sample count data from 'samples' to 'samples_dup' so that all samples are duplicated correctly
+for(col_name in names(samples_dup)) {
+  if(col_name %in% names(samples)) {
+    match_indices <- which(names(samples_dup) == col_name)
+    for(i in match_indices) {
+      samples_dup[[i]] <- samples[[col_name]]
+    }
+  }
+}
+
+# re-order files and ensure sampleIDs are still assigned to rownames/colnames
+samples_dup <- samples_dup[,order(colnames(samples_dup))]
+rownames(samples_dup) <- rownames(samples)
+meta_dup <- meta_dup[order(meta_dup$SampleID),]
+meta_rownames <- make.unique(meta_dup$SampleID)
+rownames(meta_dup) <- meta_rownames
+
+saveA <- samples_dup
+saveB <- meta_dup
+
+# expand norm.factors to match new dge which allows for appropriate modeling, but doesn't alter normalization factors of samples
+
+# create temporary data frames
+temp_df <- data.frame(sampleID = meta7$SampleID, norm.factors = x$samples$norm.factors)
+temp_df2 <- data.frame(sampleID = meta_dup$SampleID, norm.factors = NA)
+temp_df3 <- left_join(temp_df2, temp_df, by = "sampleID")
+
+# apply norm factors from actual sample size data to this expanded file
+newNorm <- temp_df3$norm.factors.y
+
+# add subsetting variable for model design
+meta_dup$Subset <- paste0(meta_dup$Time, meta_dup$D_var)
+```
+
+### Overview of samples and groups in dataset for modeling:
+
+```{r, SampleInfo dup, echo=FALSE, results='asis'}
+datatable(meta_dup)
+```
+
+### Create a new DGE object for this datafile:
+
+```{r, create new DGE object, echo=FALSE}
+y <- DGEList(counts=samples_dup)
+samplenames <- rownames(meta_dup) 
+colnames(y) <- samplenames
+
+sampleid <- as.factor(meta_dup$SampleID)
+y$samples$sampleid <- sampleid
+
+pcode <- as.factor(meta_dup$PCode)
+y$samples$pcode <- pcode
+
+group <- as.factor(meta_dup$Group) 
+y$samples$group <- group 
+
+time <- as.factor(meta_dup$Time)
+y$samples$time <- time
+
+subset <- as.factor(meta_dup$Subset)
+y$samples$subset <- subset
+
+batch <- as.factor(meta_dup$SeqBatch) 
+y$samples$batch <- batch 
+
+sex <- as.factor(meta_dup$Sex) 
+y$samples$sex <- sex 
+
+covid <- as.factor(meta_dup$Covid)
+y$samples$covid <- covid
+
+age_bin <- as.factor(meta_dup$Age_Bin)
+y$samples$age_bin <- age_bin
+
+# wbc count_bin has a few missing values. I will impute them using the median of the participant's other wbc_count_bin values
+meta_dup_imputed <- meta_dup %>%
+  group_by(PCode) %>%
+  mutate(WBC_Count = ifelse(is.na(WBC_Count), 
+                            mean(WBC_Count, na.rm = TRUE),
+                            WBC_Count)) %>%
+  ungroup()
+meta_dup_imputed <- meta_dup_imputed %>%
+  mutate(WBC_Count_Rounded = round(WBC_Count))
+
+# P88 has two NA values, but it's removed test-day (3) had a WBC_Count of 7.5. I will replace these NAs with this measured value.
+meta_dup_imputed[c(453, 454), 22] <- 8 
+
+wbc_count <- as.factor(meta_dup_imputed$WBC_Count_Rounded)
+y$samples$wbc_count <-wbc_count
+
+y$samples$norm.factors <- newNorm
+
+# create gene annotation list
+geneid <- rownames(x)
+genes <- biomaRt::select(Homo.sapiens, keys=geneid, columns=c("SYMBOL", "ENTREZID", "TXCHROM"), keytype="ENSEMBL", groupBY="ENSEMBL", selectFun=max)
+
+genes <- genes[!duplicated(genes$ENSEMBL),]
+y$genes <- genes
+
+# remove genes which were removed in previous analysis
+y$counts = y$counts[rownames(x$counts),]
+y$genes = y$genes[rownames(x$genes),]
+
+datatable(y$samples)
+y$counts[1:20,1:6]
+```
+
+### Create a design matrix and contrasts
+
+``` {r, limma - DEG analysis, and model creation}
+# create contrasts (using ~0 in front removes the intercept for group but keeps it for sex & batch)
+
+design <- model.matrix(~0 + subset + sex + age_bin + batch + wbc_count + covid)
+design
+
+
+# Specify intervention below!
+contr.matrix <- makeContrasts(
+   D0vsD1 = subsetPostTestD1 - subsetBaselineD1,
+   D0vsD2 = subsetPostTestD2 - subsetBaselineD2,
+   D0vsD3 = subsetPostTestD3 - subsetBaselineD3,
+   D0vsD4 = subsetPostTestD4 - subsetBaselineD4,
+   D0vsD5 = subsetPostTestD5 - subsetBaselineD5,
+   D0vsD6 = subsetPostTestD6 - subsetBaselineD6,
+   D0vsD7 = subsetPostTestD7 - subsetBaselineD7,
+   AllDIs = (subsetPostTestD1 + subsetPostTestD2 + subsetPostTestD3 + subsetPostTestD4 + subsetPostTestD5 + subsetPostTestD6 + subsetPostTestD7)/7 - (subsetBaselineD1 + subsetBaselineD2 + subsetBaselineD3 + subsetBaselineD4 + subsetBaselineD5 + subsetBaselineD6 + subsetBaselineD7)/7,
+   levels = colnames(design))
+contr.matrix
+```
+
+### Remove heteroscedascity from the count data
+
+#### Figure 4: Means (x-axis) and variances (y-axis) of each gene are plotted to show the dependence between teh two before voom is applied to the data (left panel) and how the trend is removed after voom precision weights are applied to the data (right panel)
+
+```{r, removing heteroscedascity from count data using VOOM, echo=FALSE}
+# APPLY TO EACH GROUP INDIVIDUALLY, one at a time
+setwd(outputdir_newCPM)
+
+v <- voom(y, design, plot=TRUE, block=pcode, correlation= dupcor$consensus.correlation, save.plot = TRUE)
+```
+
+
+### Fit the model 
+
+#### First, lmfit() is used to fit a separate model to the expression values for each gene. Next, empircal Bayes moderation is carried out by borrowing informaiton across al genes to obtain more precise estimates of gene-wise variability (Smyth 2004). 
+ 
+```{r,variance modeling at the observational level, echo=FALSE}
+# estimates the dispersion of the data, which is a measure of the variability of the measurements within each group
+
+# 'efit' models the variance of each gene as a function of the mean expression level, using a technique called empirical Bayes moderation. It is fitted to the entire dataset, regardless of which comparisons are of interest.
+
+vfit <- lmFit(v, design, block= pcode, correlation=dupcor$consensus.correlation)
+vfit <- contrasts.fit(vfit, contrasts=contr.matrix)
+efit <- eBayes(vfit)
+```
+
+#### Figure 5: The model’s residual variances are plotted against average expression values, and the variance is no longer dependent on the mean expression level.
+
+```{r, PLOT - efit, echo=FALSE}
+plotSA(efit)
+```
+
+#### Figure 6: A MDS plot of the different study comparisons post-efit modeling
+
+```{r, PLOT model, echo=FALSE}
+plotMDS(efit)
+```
+
+
+### Summary of DEGs:
+
+```{r, summary DEGs, echo=FALSE}
+dt <- decideTests(efit)
+summary(decideTests(efit))
+```
+
+
+```{r, examining individual DE genes from top to bottom, echo=FALSE}
+
+D0vsD1 <- topTreat(efit, coef=1, n=Inf) 
+D0vsD2 <- topTreat(efit, coef=2, n=Inf) 
+D0vsD3 <- topTreat(efit, coef=3, n=Inf) 
+D0vsD4 <- topTreat(efit, coef=4, n=Inf) 
+D0vsD5 <- topTreat(efit, coef=5, n=Inf) 
+D0vsD6 <- topTreat(efit, coef=6, n=Inf) 
+D0vsD7 <- topTreat(efit, coef=7, n=Inf) 
+ALLDIs <- topTreat(efit, coef=8, n=Inf)
+
+# Save lists
+#write.table(D0vsD1, file=paste0(outputdir_newCPM, "D0vsD1_1CPM_newModel_e2.txt"), sep="\t", row.names= FALSE, col.names = TRUE)
+
+#write.table(D0vsD2, file=paste0(outputdir_newCPM, "D0vsD2_1CPM_newModel_e2.txt"), sep="\t", row.names= FALSE, col.names = TRUE)
+
+#write.table(D0vsD3, file=paste0(outputdir_newCPM, "D0vsD3_1CPM_newModel_e2.txt"), sep="\t", row.names= FALSE, col.names = TRUE)
+
+#write.table(D0vsD4, file=paste0(outputdir_newCPM, "D0vsD4_1CPM_newModel_e2.txt"), sep="\t", row.names= FALSE, col.names = TRUE)
+
+#write.table(D0vsD5, file=paste0(outputdir_newCPM, "D0vsD5_1CPM_newModel_e2.txt"), sep="\t", row.names= FALSE, col.names = TRUE)
+
+#write.table(D0vsD6, file=paste0(outputdir_newCPM, "D0vsD6_1CPM_newModel_e2.txt"), sep="\t", row.names= FALSE, col.names = TRUE)
+
+#write.table(D0vsD7, file=paste0(outputdir_newCPM, "D0vsD7_1CPM_newModel_e2.txt"), sep="\t", row.names= FALSE, col.names = TRUE)
+
+#write.table(ALLDIs, file=paste0(outputdir_newCPM, "AllbaselinevsAllDIs_1CPM_newModel_e2"), sep="\t", row.names= FALSE, col.names = TRUE)
+```
+
+
+### Examining individual DE genes from top to bottom by adjusted p-value
+
+```{r, DEG summary}
+head(D0vsD1)
+head(D0vsD2)
+head(D0vsD3)
+head(D0vsD4)
+head(D0vsD5)
+head(D0vsD6)
+head(D0vsD7)
+head(ALLDIs)
+```
+
+
+#### Figure 6: MD plot of DEGs- log-FCs vs log-CPM values are shown in the left panel which is linked to the individual values per sample for a selected gene.
+
+```{r, PLOT - DE results, echo=FALSE}
+# I used interactive Glimma plots but manual plots are included for html output
+lcpmy <- cpm(y, log=TRUE)
+
+plotMD(efit, column=1, status=dt[,1], main=colnames(efit)[1], xlim=c(-8,13))
+
+plotMD(efit, column=2, status=dt[,2], main=colnames(efit)[2], xlim=c(-8,13))
+
+plotMD(efit, column=3, status=dt[,3], main=colnames(efit)[3], xlim=c(-8,13))
+
+plotMD(efit, column=4, status=dt[,4], main=colnames(efit)[4], xlim=c(-8,13))
+
+plotMD(efit, column=5, status=dt[,5], main=colnames(efit)[5], xlim=c(-8,13))
+
+plotMD(efit, column=6, status=dt[,6], main=colnames(efit)[6], xlim=c(-8,13))
+
+plotMD(efit, column=7, status=dt[,7], main=colnames(efit)[7], xlim=c(-8,13))
+
+plotMD(efit, column=8, status=dt[,8], main=colnames(efit)[8], xlim=c(-8,13))
+
+# Interactive plot:
+#lcpmy <- cpm(y, log=TRUE)
+
+# subset works but has too many groups... add a column?
+#subset_di <- ifelse(y$samples$subset == "PostTestD7", "PostTestD7",
+#                     ifelse(grepl("^PostTestD\\d+$", y$samples$subset),
+#                            "PostTestOther",
+#                            ifelse(y$samples$subset == "BaselineD7", "BaselineD7",
+#                                   ifelse(grepl("^BaselineD\\d+$", y$samples$subset),
+#                                          "BaselineOther",
+#                                          NA))))
+#subset_di <- as.factor(subset_di) 
+#y$samples$subset_di <- subset_di 
+
+#glMDPlot(efit, coef=7, status=dt, main=colnames(efit)[7],
+#        side.main="ENSEMBL", counts=lcpmy, groups=subset_di, 
+#        launch=TRUE)
+```
+
+#### Figure 7: Heatmap of log-CPM values for top 50 genes DE in different internventions (top genes of DI 1-7, then all interventions pre vs post)
+
+```{r, PLOT - heatmap, include=TRUE, echo=FALSE, message=FALSE, warning=FALSE}
+library(gplots)
+lcpmy <- cpm(y, log=TRUE)
+topgenes <- D0vsD1$ENSEMBL[1:50]
+subset_samples <- which(y$samples[,'subset'] == "BaselineD1" | y$samples[, 'subset'] == "PostTestD1")
+topgenesy <-lcpmy[row.names(lcpmy) %in% topgenes, subset_samples]
+
+mycol <- colorpanel(1000,"blue","white","red")
+heatmap.2(topgenesy, scale="row",
+   labRow=v$genes$ENTREZID[topgenes], labCol=sampleid[subset_samples],
+   col=mycol, trace="none", density.info="none", 
+   dendrogram="column", )
+
+
+topgenes <- D0vsD2$ENSEMBL[1:50]
+subset_samples <- which(y$samples[,'subset'] == "BaselineD2" | y$samples[, 'subset'] == "PostTestD2")
+topgenesy <-lcpmy[row.names(lcpmy) %in% topgenes, subset_samples]
+
+mycol <- colorpanel(1000,"blue","white","red")
+heatmap.2(topgenesy, scale="row",
+   labRow=v$genes$ENTREZID[topgenes], labCol=sampleid[subset_samples],
+   col=mycol, trace="none", density.info="none", 
+   dendrogram="column", )
+
+
+topgenes <- D0vsD3$ENSEMBL[1:50]
+subset_samples <- which(y$samples[,'subset'] == "BaselineD3" | y$samples[, 'subset'] == "PostTestD3")
+topgenesy <-lcpmy[row.names(lcpmy) %in% topgenes, subset_samples]
+
+mycol <- colorpanel(1000,"blue","white","red")
+heatmap.2(topgenesy, scale="row",
+   labRow=v$genes$ENTREZID[topgenes], labCol=sampleid[subset_samples],
+   col=mycol, trace="none", density.info="none", 
+   dendrogram="column", )
+
+
+topgenes <- D0vsD4$ENSEMBL[1:50]
+subset_samples <- which(y$samples[,'subset'] == "BaselineD4" | y$samples[, 'subset'] == "PostTestD4")
+topgenesy <-lcpmy[row.names(lcpmy) %in% topgenes, subset_samples]
+
+mycol <- colorpanel(1000,"blue","white","red")
+heatmap.2(topgenesy, scale="row",
+   labRow=v$genes$ENTREZID[topgenes], labCol=sampleid[subset_samples],
+   col=mycol, trace="none", density.info="none", 
+   dendrogram="column", )
+
+
+topgenes <- D0vsD5$ENSEMBL[1:50]
+subset_samples <- which(y$samples[,'subset'] == "BaselineD5" | y$samples[, 'subset'] == "PostTestD5")
+topgenesy <-lcpmy[row.names(lcpmy) %in% topgenes, subset_samples]
+
+mycol <- colorpanel(1000,"blue","white","red")
+heatmap.2(topgenesy, scale="row",
+   labRow=v$genes$ENTREZID[topgenes], labCol=sampleid[subset_samples],
+   col=mycol, trace="none", density.info="none", 
+   dendrogram="column", )
+
+
+topgenes <- D0vsD6$ENSEMBL[1:50]
+subset_samples <- which(y$samples[,'subset'] == "BaselineD6" | y$samples[, 'subset'] == "PostTestD6")
+topgenesy <-lcpmy[row.names(lcpmy) %in% topgenes, subset_samples]
+
+mycol <- colorpanel(1000,"blue","white","red")
+heatmap.2(topgenesy, scale="row",
+   labRow=v$genes$ENTREZID[topgenes], labCol=sampleid[subset_samples],
+   col=mycol, trace="none", density.info="none", 
+   dendrogram="column", )
+
+
+topgenes <- D0vsD7$ENSEMBL[1:50]
+subset_samples <- which(y$samples[,'subset'] == "BaselineD7" | y$samples[, 'subset'] == "PostTestD7")
+topgenesy <-lcpmy[row.names(lcpmy) %in% topgenes, subset_samples]
+
+mycol <- colorpanel(1000,"blue","white","red")
+heatmap.2(topgenesy, scale="row",
+   labRow=v$genes$ENTREZID[topgenes], labCol=sampleid[subset_samples],
+   col=mycol, trace="none", density.info="none", 
+   dendrogram="column", )
+```
+
+```{r, session info}
+sessionInfo()
+```
